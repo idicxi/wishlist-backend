@@ -34,7 +34,7 @@ app.add_middleware(
 
 # Роуты аутентификации
 app.include_router(auth_router)
-
+Base.metadata.create_all(bind=engine)
 def _slugify_title(title: str) -> str:
     base = (
         title.strip()
