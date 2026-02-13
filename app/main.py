@@ -29,8 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Создаём таблицы, если их ещё нет (важно после удаления wishlist.db)
-Base.metadata.create_all(bind=engine)
+
 
 # Роуты аутентификации
 app.include_router(auth_router)
