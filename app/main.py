@@ -16,9 +16,12 @@ from .websocket_manager import manager
 
 app = FastAPI(title="Социальный вишлист")
 
+
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://wishlist-frontend.vercel.app",
+    "https://wishlist-frontend-xi.vercel.app",
 ]
 
 app.add_middleware(
@@ -28,8 +31,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 
 # Роуты аутентификации
 app.include_router(auth_router)
@@ -121,7 +122,6 @@ def delete_gift(gift_id: int, db: Session = Depends(get_db)):
 def root():
     return {"message": "Социальный вишлист API работает! 🎉"}
 
-
 @app.get("/stats")
 def get_stats(db: Session = Depends(get_db)):
     """Сводка для главной: всего собрано, цель, последние скинувшиеся."""
@@ -154,7 +154,6 @@ def get_stats(db: Session = Depends(get_db)):
         "recent_contributors": contributors,
     }
 
-
 @app.post("/wishlists/")
 def create_wishlist(payload: schemas.WishlistCreateWithOwner, db: Session = Depends(get_db)):
     slug = generate_unique_slug(payload.title, db)
@@ -183,6 +182,7 @@ def list_wishlists(user_id: int, db: Session = Depends(get_db)):
 def get_wishlist(slug: str, db: Session = Depends(get_db)):
     wishlist = db.query(models.Wishlist).filter(models.Wishlist.slug == slug).first()
     return wishlist
+
 @app.post("/gifts/")
 async def create_gift(
     title: str,
@@ -240,7 +240,6 @@ async def create_gift(
         print(f"Error creating gift: {e}")
         return {"error": str(e)}
 
-
 @app.post("/gifts/{gift_id}/reserve")
 async def reserve_gift(
     gift_id: int, 
@@ -257,7 +256,6 @@ async def reserve_gift(
         if gift.is_reserved:
             return {"error": "Подарок уже забронирован"}
 
-        # Проверяем вклады
         contributions_count = db.query(models.Contribution).filter(
             models.Contribution.gift_id == gift_id
         ).count()
@@ -265,7 +263,6 @@ async def reserve_gift(
         if contributions_count > 0:
             return {"error": "Нельзя забронировать подарок, на который уже скинулись"}
 
-        # Создаем бронь
         reservation = models.Reservation(gift_id=gift_id, user_id=user_id)
         gift.is_reserved = True
 
@@ -273,11 +270,10 @@ async def reserve_gift(
         db.commit()
         db.refresh(gift)
 
-        # ✅ ПОЛУЧАЕМ ИМЯ ПОЛЬЗОВАТЕЛЯ!
         user = db.query(models.User).filter(models.User.id == user_id).first()
         user_name = user.name if user else f"User {user_id}"
         
-        print(f"✅ USER NAME: {user_name}")  # ← ЭТО ДОЛЖНО ПОКАЗАТЬ ИМЯ!
+        print(f"✅ USER NAME: {user_name}")
 
         await manager.broadcast_to_wishlist(
             str(gift.wishlist_id),
@@ -285,7 +281,7 @@ async def reserve_gift(
                 "type": "item_reserved",
                 "gift_id": gift_id,
                 "user_id": user_id,
-                "user_name": user_name,  # ← ЭТО КЛЮЧЕВОЕ!
+                "user_name": user_name,
                 "wishlist_id": gift.wishlist_id
             },
         )
@@ -370,7 +366,6 @@ def get_gifts(wishlist_id: int, db: Session = Depends(get_db)):
         price_value = float(gift.price) if gift.price is not None else 0.0
         progress = int((total_value / price_value) * 100) if price_value > 0 else 0
 
-        # Информация о том, кто забронировал
         reservation = gift.reservation
         reserved_by = None
         if reservation:
@@ -380,8 +375,6 @@ def get_gifts(wishlist_id: int, db: Session = Depends(get_db)):
                 "name": user.name
             } if user else None
 
-        # Информация о том, кто скинулся
-               # Информация о том, кто скинулся
         contributors = []
         for c in gift.contributions:
             user = db.query(models.User).filter(models.User.id == c.user_id).first()
@@ -393,7 +386,6 @@ def get_gifts(wishlist_id: int, db: Session = Depends(get_db)):
                 "created_at": c.created_at.isoformat() if c.created_at else None
             })
 
-        # Сортируем вклады по дате (сначала новые)
         contributors.sort(key=lambda x: x["created_at"], reverse=True)
 
         result.append(
@@ -483,7 +475,6 @@ async def websocket_landing(websocket: WebSocket):
         print(f"WebSocket landing error: {e}")
     finally:
         manager.disconnect_landing(websocket)
-
 
 @app.websocket("/ws/wishlists/{wishlist_id}")
 async def websocket_endpoint(websocket: WebSocket, wishlist_id: int):
