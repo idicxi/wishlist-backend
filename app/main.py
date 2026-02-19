@@ -520,7 +520,7 @@ async def contribute(
             "gift_id": gift_id,
             "amount": float(amount),
             "total": float(total),
-            "user_id": user_id,
+            "user_id": current_user_id,
             "user_name": contribution.user.name,
         },
     )
@@ -595,7 +595,8 @@ def get_gifts(
             "progress": progress,
             "reserved_by": reserved_by,
             "contributors": contributors,
-            "has_contributions": len(contributors) > 0 if not is_owner else (total_value > 0),
+            # Владелец не должен видеть ни участников, ни сам факт сбора
+            "has_contributions": len(contributors) > 0 if not is_owner else False,
         })
 
     return result
