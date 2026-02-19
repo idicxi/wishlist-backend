@@ -4,9 +4,8 @@ import random
 import re
 import string
 from datetime import datetime
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func
@@ -147,10 +146,20 @@ def parse_url(url: str):
     if not u.startswith(("http://", "https://")):
         u = "https://" + u
     try:
-        req = Request(u, headers={"User-Agent": "Mozilla/5.0 (compatible; WishlistBot/1.0)"})
-        with urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        with httpx.Client(follow_redirects=True, timeout=10.0) as client:
+            resp = client.get(u, headers=headers)
+            resp.raise_for_status()
+            html = resp.text
+    except httpx.HTTPError as e:
         print(f"parse-url fetch error: {e}")
         return {"title": None, "image": None, "price": None}
     title = None
@@ -169,6 +178,11 @@ def parse_url(url: str):
             title = meta.group(1).strip()
             if title:
                 break
+    # Фоллбэк: <title>...</title>
+    if not title:
+        m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+        if m:
+            title = m.group(1).strip()
     for meta in re.finditer(
         r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]+content=["\']([^"\']+)["\']',
         html,
@@ -182,10 +196,15 @@ def parse_url(url: str):
             image = meta.group(1).strip()
             if image and image.startswith(("http://", "https://")):
                 break
-    price_match = re.search(r'"price"\s*:\s*["\']?([0-9]+[.,]?[0-9]*)["\']?', html)
+    # Ищем цену в JSON / meta / тексте
+    price_match = re.search(r'"price"\s*:\s*["\']?([0-9\s.,]+)["\']?', html)
+    if not price_match:
+        price_match = re.search(r'content=["\']([0-9\s.,]+)\s*(?:₽|RUB)["\']', html)
     if price_match:
+        raw = price_match.group(1)
+        raw = raw.replace(" ", "").replace("\xa0", "").replace(",", ".")
         try:
-            price = float(price_match.group(1).replace(",", "."))
+            price = float(raw)
         except ValueError:
             price = None
     return {"title": title, "image": image, "price": price}
