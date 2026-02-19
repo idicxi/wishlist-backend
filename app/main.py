@@ -4,6 +4,7 @@ import random
 import re
 import string
 from datetime import datetime
+import html
 import json
 from urllib.parse import urljoin
 
@@ -205,9 +206,19 @@ def parse_url(url: str):
             img = obj.get("image")
             if not image and isinstance(img, str):
                 image = img
+            elif not image and isinstance(img, dict):
+                # Некоторые сайты кладут image как ImageObject с полем url
+                url_val = img.get("url")
+                if isinstance(url_val, str):
+                    image = url_val
             elif not image and isinstance(img, list) and img:
-                if isinstance(img[0], str):
-                    image = img[0]
+                first = img[0]
+                if isinstance(first, str):
+                    image = first
+                elif isinstance(first, dict):
+                    url_val = first.get("url")
+                    if isinstance(url_val, str):
+                        image = url_val
 
             # Цена: либо прямо в объекте, либо в offers
             offers = obj.get("offers")
@@ -259,6 +270,17 @@ def parse_url(url: str):
         m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
         if m:
             title = m.group(1).strip()
+
+    # Чистим title: HTML-сущности и хвосты с названием сайта/продавца
+    if title:
+        # Декодируем &quot; &amp; и т.п.
+        title = html.unescape(title)
+        # Режем по разделителям « | », « — », « - », оставляем первую часть
+        for sep in [" | ", " — ", " - "]:
+            if sep in title:
+                title = title.split(sep)[0]
+                break
+        title = title.strip(" \u00a0-–—")
 
     # 3) og:image / twitter:image
     for meta in re.finditer(
