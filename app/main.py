@@ -4,6 +4,7 @@ import random
 import re
 import string
 from datetime import datetime
+import json
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
@@ -162,9 +163,82 @@ def parse_url(url: str):
     except httpx.HTTPError as e:
         print(f"parse-url fetch error: {e}")
         return {"title": None, "image": None, "price": None}
-    title = None
-    image = None
-    price = None
+    title: str | None = None
+    image: str | None = None
+    price: float | None = None
+
+    # 1) Пытаемся вытащить структурированные данные (Schema.org Product / Offer / AggregateOffer)
+    for m in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>',
+        html,
+        re.I,
+    ):
+        raw_json = m.group(1).strip()
+        if not raw_json:
+            continue
+        # Некоторые сайты кладут несколько JSON-объектов подряд — игнорируем ошибки парсинга
+        try:
+            data = json.loads(raw_json)
+        except Exception:
+            continue
+
+        def extract_from_obj(obj: dict):
+            nonlocal title, image, price
+            if not isinstance(obj, dict):
+                return
+            t = obj.get("@type") or obj.get("type")
+            if isinstance(t, str):
+                t = [t]
+            if isinstance(t, list) and not any(
+                x in ("Product", "Offer", "AggregateOffer") for x in t
+            ):
+                # Не продукт — пропускаем
+                pass
+
+            # Название
+            if not title and isinstance(obj.get("name"), str):
+                title = obj["name"].strip() or title
+
+            # Картинка
+            img = obj.get("image")
+            if not image and isinstance(img, str):
+                image = img
+            elif not image and isinstance(img, list) and img:
+                if isinstance(img[0], str):
+                    image = img[0]
+
+            # Цена: либо прямо в объекте, либо в offers
+            offers = obj.get("offers")
+            candidates = []
+            if isinstance(offers, dict):
+                candidates.append(offers)
+            elif isinstance(offers, list):
+                candidates.extend([o for o in offers if isinstance(o, dict)])
+
+            for off in candidates:
+                p = off.get("price") or off.get("lowPrice")
+                if isinstance(p, (int, float)):
+                    price = float(p)
+                    break
+                if isinstance(p, str):
+                    raw = (
+                        p.replace(" ", "")
+                        .replace("\xa0", "")
+                        .replace(",", ".")
+                    )
+                    try:
+                        price = float(raw)
+                        break
+                    except ValueError:
+                        continue
+
+        if isinstance(data, dict):
+            extract_from_obj(data)
+        elif isinstance(data, list):
+            for item in data:
+                extract_from_obj(item)
+
+    # 2) og:title / twitter:title + fallback <title>
     for meta in re.finditer(
         r'<meta[^>]+(?:property|name)=["\'](?:og:title|twitter:title)["\'][^>]+content=["\']([^"\']+)["\']',
         html,
@@ -183,6 +257,8 @@ def parse_url(url: str):
         m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
         if m:
             title = m.group(1).strip()
+
+    # 3) og:image / twitter:image
     for meta in re.finditer(
         r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]+content=["\']([^"\']+)["\']',
         html,
@@ -196,7 +272,8 @@ def parse_url(url: str):
             image = meta.group(1).strip()
             if image and image.startswith(("http://", "https://")):
                 break
-    # Ищем цену в JSON / meta / тексте
+
+    # 4) Попытка достать цену по текстовым паттернам, если не нашли в JSON-LD
     price_match = re.search(r'"price"\s*:\s*["\']?([0-9\s.,]+)["\']?', html)
     if not price_match:
         price_match = re.search(r'content=["\']([0-9\s.,]+)\s*(?:₽|RUB)["\']', html)
