@@ -142,12 +142,14 @@ def root():
 
 @app.get("/api/parse-url")
 def parse_url(url: str):
-    """Извлекает og:title, og:image (и по возможности цену) по URL для автозаполнения карточки подарка."""
+    """Простой парсер: тянем og:title/og:image/<title> и цену по типовым паттернам."""
     if not url or not url.strip():
         return {"title": None, "image": None, "price": None}
+
     u = url.strip()
     if not u.startswith(("http://", "https://")):
         u = "https://" + u
+
     try:
         headers = {
             "User-Agent": (
@@ -161,131 +163,53 @@ def parse_url(url: str):
         with httpx.Client(follow_redirects=True, timeout=10.0) as client:
             resp = client.get(u, headers=headers)
             resp.raise_for_status()
-            html = resp.text
+            html_text = resp.text
             base_url = str(resp.url)
     except httpx.HTTPError as e:
         print(f"parse-url fetch error: {e}")
         return {"title": None, "image": None, "price": None}
+
     title: str | None = None
     image: str | None = None
     price: float | None = None
 
-    # 1) Пытаемся вытащить структурированные данные (Schema.org Product / Offer / AggregateOffer)
-    for m in re.finditer(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>',
-        html,
-        re.I,
-    ):
-        raw_json = m.group(1).strip()
-        if not raw_json:
-            continue
-        # Некоторые сайты кладут несколько JSON-объектов подряд — игнорируем ошибки парсинга
-        try:
-            data = json.loads(raw_json)
-        except Exception:
-            continue
-
-        def extract_from_obj(obj: dict):
-            nonlocal title, image, price
-            if not isinstance(obj, dict):
-                return
-            t = obj.get("@type") or obj.get("type")
-            if isinstance(t, str):
-                t = [t]
-            if isinstance(t, list) and not any(
-                x in ("Product", "Offer", "AggregateOffer") for x in t
-            ):
-                # Не продукт — пропускаем
-                pass
-
-            # Название
-            if not title and isinstance(obj.get("name"), str):
-                title = obj["name"].strip() or title
-
-            # Картинка
-            img = obj.get("image")
-            if not image and isinstance(img, str):
-                image = img
-            elif not image and isinstance(img, dict):
-                # Некоторые сайты кладут image как ImageObject с полем url
-                url_val = img.get("url")
-                if isinstance(url_val, str):
-                    image = url_val
-            elif not image and isinstance(img, list) and img:
-                first = img[0]
-                if isinstance(first, str):
-                    image = first
-                elif isinstance(first, dict):
-                    url_val = first.get("url")
-                    if isinstance(url_val, str):
-                        image = url_val
-
-            # Цена: либо прямо в объекте, либо в offers
-            offers = obj.get("offers")
-            candidates = []
-            if isinstance(offers, dict):
-                candidates.append(offers)
-            elif isinstance(offers, list):
-                candidates.extend([o for o in offers if isinstance(o, dict)])
-
-            for off in candidates:
-                p = off.get("price") or off.get("lowPrice")
-                if isinstance(p, (int, float)):
-                    price = float(p)
-                    break
-                if isinstance(p, str):
-                    raw = (
-                        p.replace(" ", "")
-                        .replace("\xa0", "")
-                        .replace(",", ".")
-                    )
-                    try:
-                        price = float(raw)
-                        break
-                    except ValueError:
-                        continue
-
-        if isinstance(data, dict):
-            extract_from_obj(data)
-        elif isinstance(data, list):
-            for item in data:
-                extract_from_obj(item)
-
-    # 2) og:title / twitter:title + fallback <title>
+    # 1) og:title / twitter:title
     for meta in re.finditer(
         r'<meta[^>]+(?:property|name)=["\'](?:og:title|twitter:title)["\'][^>]+content=["\']([^"\']+)["\']',
-        html,
+        html_text,
         re.I,
     ):
         title = meta.group(1).strip()
         if title:
             break
     if not title:
-        for meta in re.finditer(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:title|twitter:title)["\']', html, re.I):
+        for meta in re.finditer(
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:title|twitter:title)["\']',
+            html_text,
+            re.I,
+        ):
             title = meta.group(1).strip()
             if title:
                 break
-    # Фоллбэк: <title>...</title>
+
+    # Фолбэк: <title>...</title>
     if not title:
-        m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+        m = re.search(r"<title[^>]*>([^<]+)</title>", html_text, re.I)
         if m:
             title = m.group(1).strip()
 
-    # Чистим title: HTML-сущности и хвосты с названием сайта/продавца
     if title:
-        # Декодируем &quot; &amp; и т.п.
         title = html.unescape(title)
-        # Режем по разделителям « | », « — », « - », оставляем первую часть
         for sep in [" | ", " — ", " - "]:
             if sep in title:
                 title = title.split(sep)[0]
                 break
         title = title.strip(" \u00a0-–—")
 
-    # 3) og:image / twitter:image
+    # 2) og:image / twitter:image
     for meta in re.finditer(
         r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]+content=["\']([^"\']+)["\']',
-        html,
+        html_text,
         re.I,
     ):
         candidate = meta.group(1).strip()
@@ -293,25 +217,28 @@ def parse_url(url: str):
             image = candidate
             break
     if not image:
-        for meta in re.finditer(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\']', html, re.I):
+        for meta in re.finditer(
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\']',
+            html_text,
+            re.I,
+        ):
             candidate = meta.group(1).strip()
             if candidate:
                 image = candidate
                 break
 
-    # Нормализуем URL картинки: протокол-относительные и относительные пути
     if image:
         if image.startswith("//"):
-            # //cdn.site.com/img.jpg -> https://cdn.site.com/img.jpg
             image = "https:" + image
-        elif not image.startswith(("http://", "https://")) and "base_url" in locals():
-            # /img/pic.jpg или img/pic.jpg -> абсолютный URL
+        elif not image.startswith(("http://", "https://")):
             image = urljoin(base_url, image)
 
-    # 4) Попытка достать цену по текстовым паттернам, если не нашли в JSON-LD
-    price_match = re.search(r'"price"\s*:\s*["\']?([0-9\s.,]+)["\']?', html)
+    # 3) Цена по простым паттернам
+    price_match = re.search(r'"price"\s*:\s*["\']?([0-9\s.,]+)["\']?', html_text)
     if not price_match:
-        price_match = re.search(r'content=["\']([0-9\s.,]+)\s*(?:₽|RUB)["\']', html)
+        price_match = re.search(
+            r'content=["\']([0-9\s.,]+)\s*(?:₽|RUB)["\']', html_text
+        )
     if price_match:
         raw = price_match.group(1)
         raw = raw.replace(" ", "").replace("\xa0", "").replace(",", ".")
@@ -319,6 +246,7 @@ def parse_url(url: str):
             price = float(raw)
         except ValueError:
             price = None
+
     return {"title": title, "image": image, "price": price}
 
 
