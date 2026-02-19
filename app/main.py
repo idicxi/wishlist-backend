@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import random
+import re
 import string
 from datetime import datetime
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import models, schemas
-from .auth import router as auth_router
+from .auth import (
+    get_current_user_id_optional,
+    get_current_user_id_required,
+    router as auth_router,
+)
 from .database import Base, engine, get_db
 from .websocket_manager import manager
 
@@ -18,8 +25,6 @@ app = FastAPI(title="Социальный вишлист")
 
 
 origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
     "https://wishlist-frontend.vercel.app",
     "https://wishlist-frontend-xi.vercel.app",
 ]
@@ -63,7 +68,6 @@ def generate_unique_slug(title: str, db: Session) -> str:
 
     return slug
 
-# ОБНОВЛЕНИЕ ПОДАРКА
 @app.put("/gifts/{gift_id}")
 def update_gift(
     gift_id: int,
@@ -71,13 +75,16 @@ def update_gift(
     price: float | None = None,
     url: str | None = None,
     image_url: str | None = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id_required),
 ):
     try:
         gift = db.query(models.Gift).filter(models.Gift.id == gift_id).first()
         if not gift:
             return {"error": "Подарок не найден"}
-        
+        wishlist = db.query(models.Wishlist).filter(models.Wishlist.id == gift.wishlist_id).first()
+        if not wishlist or wishlist.owner_id != current_user_id:
+            raise HTTPException(status_code=403, detail="Только владелец вишлиста может редактировать подарок")
         if title is not None:
             gift.title = title
         if price is not None:
@@ -86,10 +93,8 @@ def update_gift(
             gift.url = url
         if image_url is not None:
             gift.image_url = image_url
-        
         db.commit()
         db.refresh(gift)
-        
         return {
             "id": gift.id,
             "title": gift.title,
@@ -97,23 +102,33 @@ def update_gift(
             "url": gift.url,
             "image_url": gift.image_url,
             "wishlist_id": gift.wishlist_id,
-            "is_reserved": gift.is_reserved
+            "is_reserved": gift.is_reserved,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error updating gift: {e}")
         return {"error": str(e)}
 
-# УДАЛЕНИЕ ПОДАРКА
+
 @app.delete("/gifts/{gift_id}")
-def delete_gift(gift_id: int, db: Session = Depends(get_db)):
+def delete_gift(
+    gift_id: int,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id_required),
+):
     try:
         gift = db.query(models.Gift).filter(models.Gift.id == gift_id).first()
         if not gift:
             return {"error": "Подарок не найден"}
-        
+        wishlist = db.query(models.Wishlist).filter(models.Wishlist.id == gift.wishlist_id).first()
+        if not wishlist or wishlist.owner_id != current_user_id:
+            raise HTTPException(status_code=403, detail="Только владелец вишлиста может удалить подарок")
         db.delete(gift)
         db.commit()
         return {"status": "deleted"}
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error deleting gift: {e}")
         return {"error": str(e)}
@@ -121,6 +136,60 @@ def delete_gift(gift_id: int, db: Session = Depends(get_db)):
 @app.get("/")
 def root():
     return {"message": "Социальный вишлист API работает! 🎉"}
+
+
+@app.get("/api/parse-url")
+def parse_url(url: str):
+    """Извлекает og:title, og:image (и по возможности цену) по URL для автозаполнения карточки подарка."""
+    if not url or not url.strip():
+        return {"title": None, "image": None, "price": None}
+    u = url.strip()
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    try:
+        req = Request(u, headers={"User-Agent": "Mozilla/5.0 (compatible; WishlistBot/1.0)"})
+        with urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"parse-url fetch error: {e}")
+        return {"title": None, "image": None, "price": None}
+    title = None
+    image = None
+    price = None
+    for meta in re.finditer(
+        r'<meta[^>]+(?:property|name)=["\'](?:og:title|twitter:title)["\'][^>]+content=["\']([^"\']+)["\']',
+        html,
+        re.I,
+    ):
+        title = meta.group(1).strip()
+        if title:
+            break
+    if not title:
+        for meta in re.finditer(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:title|twitter:title)["\']', html, re.I):
+            title = meta.group(1).strip()
+            if title:
+                break
+    for meta in re.finditer(
+        r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]+content=["\']([^"\']+)["\']',
+        html,
+        re.I,
+    ):
+        image = meta.group(1).strip()
+        if image and image.startswith(("http://", "https://")):
+            break
+    if not image:
+        for meta in re.finditer(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\']', html, re.I):
+            image = meta.group(1).strip()
+            if image and image.startswith(("http://", "https://")):
+                break
+    price_match = re.search(r'"price"\s*:\s*["\']?([0-9]+[.,]?[0-9]*)["\']?', html)
+    if price_match:
+        try:
+            price = float(price_match.group(1).replace(",", "."))
+        except ValueError:
+            price = None
+    return {"title": title, "image": image, "price": price}
+
 
 @app.get("/stats")
 def get_stats(db: Session = Depends(get_db)):
@@ -155,25 +224,33 @@ def get_stats(db: Session = Depends(get_db)):
     }
 
 @app.post("/wishlists/")
-def create_wishlist(payload: schemas.WishlistCreateWithOwner, db: Session = Depends(get_db)):
+def create_wishlist(
+    payload: schemas.WishlistCreateWithOwner,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id_required),
+):
     slug = generate_unique_slug(payload.title, db)
     wishlist = models.Wishlist(
         title=payload.title,
         description=payload.description,
         event_date=payload.event_date,
         slug=slug,
-        owner_id=payload.owner_id,
+        owner_id=current_user_id,
     )
     db.add(wishlist)
     db.commit()
     db.refresh(wishlist)
     return wishlist
 
+
 @app.get("/wishlists/")
-def list_wishlists(user_id: int, db: Session = Depends(get_db)):
+def list_wishlists(
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id_required),
+):
     wishlists = (
         db.query(models.Wishlist)
-        .filter(models.Wishlist.owner_id == user_id)
+        .filter(models.Wishlist.owner_id == current_user_id)
         .all()
     )
     return wishlists
@@ -191,8 +268,14 @@ async def create_gift(
     url: str | None = None,
     image_url: str | None = None,
     db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id_required),
 ):
     try:
+        wishlist = db.query(models.Wishlist).filter(models.Wishlist.id == wishlist_id).first()
+        if not wishlist:
+            raise HTTPException(status_code=404, detail="Вишлист не найден")
+        if wishlist.owner_id != current_user_id:
+            raise HTTPException(status_code=403, detail="Только владелец вишлиста может добавлять подарки")
         gift = models.Gift(
             title=title,
             price=price,
@@ -236,19 +319,20 @@ async def create_gift(
             "collected": 0,
             "progress": 0,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error creating gift: {e}")
         return {"error": str(e)}
 
+
 @app.post("/gifts/{gift_id}/reserve")
 async def reserve_gift(
-    gift_id: int, 
-    user_id: int,
-    db: Session = Depends(get_db)
+    gift_id: int,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id_required),
 ):
     try:
-        print(f"🔥 RESERVE HIT: gift_id={gift_id}, user_id={user_id}")
-        
         gift = db.query(models.Gift).filter(models.Gift.id == gift_id).first()
         if not gift:
             return {"error": "Подарок не найден"}
@@ -259,35 +343,31 @@ async def reserve_gift(
         contributions_count = db.query(models.Contribution).filter(
             models.Contribution.gift_id == gift_id
         ).count()
-        
         if contributions_count > 0:
             return {"error": "Нельзя забронировать подарок, на который уже скинулись"}
 
-        reservation = models.Reservation(gift_id=gift_id, user_id=user_id)
+        reservation = models.Reservation(gift_id=gift_id, user_id=current_user_id)
         gift.is_reserved = True
 
         db.add(reservation)
         db.commit()
         db.refresh(gift)
 
-        user = db.query(models.User).filter(models.User.id == user_id).first()
-        user_name = user.name if user else f"User {user_id}"
-        
-        print(f"✅ USER NAME: {user_name}")
+        user = db.query(models.User).filter(models.User.id == current_user_id).first()
+        user_name = user.name if user else f"User {current_user_id}"
 
         await manager.broadcast_to_wishlist(
             str(gift.wishlist_id),
             {
                 "type": "item_reserved",
                 "gift_id": gift_id,
-                "user_id": user_id,
+                "user_id": current_user_id,
                 "user_name": user_name,
-                "wishlist_id": gift.wishlist_id
+                "wishlist_id": gift.wishlist_id,
             },
         )
 
         return {"message": "Подарок забронирован!"}
-        
     except Exception as e:
         print(f"Error reserving gift: {e}")
         return {"error": str(e)}
@@ -296,8 +376,8 @@ async def reserve_gift(
 async def contribute(
     gift_id: int,
     amount: float,
-    user_id: int,
     db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id_required),
 ):
     gift = db.query(models.Gift).filter(models.Gift.id == gift_id).first()
     if not gift:
@@ -306,7 +386,7 @@ async def contribute(
     if gift.is_reserved:
         return {"error": "Подарок уже полностью выкуплен"}
 
-    contribution = models.Contribution(gift_id=gift_id, user_id=user_id, amount=amount)
+    contribution = models.Contribution(gift_id=gift_id, user_id=current_user_id, amount=amount)
     db.add(contribution)
     db.commit()
     db.refresh(contribution)
@@ -345,7 +425,16 @@ async def contribute(
     }
 
 @app.get("/wishlists/{wishlist_id}/gifts")
-def get_gifts(wishlist_id: int, db: Session = Depends(get_db)):
+def get_gifts(
+    wishlist_id: int,
+    db: Session = Depends(get_db),
+    current_user_id: int | None = Depends(get_current_user_id_optional),
+):
+    wishlist = db.query(models.Wishlist).filter(models.Wishlist.id == wishlist_id).first()
+    if not wishlist:
+        raise HTTPException(status_code=404, detail="Вишлист не найден")
+    is_owner = current_user_id is not None and wishlist.owner_id == current_user_id
+
     gifts = (
         db.query(models.Gift)
         .filter(models.Gift.wishlist_id == wishlist_id)
@@ -366,70 +455,75 @@ def get_gifts(wishlist_id: int, db: Session = Depends(get_db)):
         price_value = float(gift.price) if gift.price is not None else 0.0
         progress = int((total_value / price_value) * 100) if price_value > 0 else 0
 
-        reservation = gift.reservation
         reserved_by = None
-        if reservation:
-            user = db.query(models.User).filter(models.User.id == reservation.user_id).first()
-            reserved_by = {
-                "id": user.id,
-                "name": user.name
-            } if user else None
-
         contributors = []
-        for c in gift.contributions:
-            user = db.query(models.User).filter(models.User.id == c.user_id).first()
-            contributors.append({
-                "id": c.id,
-                "user_id": c.user_id,
-                "user_name": user.name if user else f"User {c.user_id}",
-                "amount": float(c.amount),
-                "created_at": c.created_at.isoformat() if c.created_at else None
-            })
+        if not is_owner:
+            reservation = gift.reservation
+            if reservation:
+                user = db.query(models.User).filter(models.User.id == reservation.user_id).first()
+                reserved_by = (
+                    {"id": user.id, "name": user.name} if user else None
+                )
+            for c in gift.contributions:
+                user = db.query(models.User).filter(models.User.id == c.user_id).first()
+                contributors.append({
+                    "id": c.id,
+                    "user_id": c.user_id,
+                    "user_name": user.name if user else f"User {c.user_id}",
+                    "amount": float(c.amount),
+                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                })
+            contributors.sort(key=lambda x: x["created_at"], reverse=True)
 
-        contributors.sort(key=lambda x: x["created_at"], reverse=True)
-
-        result.append(
-            {
-                "id": gift.id,
-                "title": gift.title,
-                "price": price_value,
-                "url": gift.url,
-                "image_url": gift.image_url,
-                "is_reserved": gift.is_reserved,
-                "collected": total_value,
-                "progress": progress,
-                "reserved_by": reserved_by,
-                "contributors": contributors,
-                "has_contributions": len(contributors) > 0,
-            }
-        )
+        result.append({
+            "id": gift.id,
+            "title": gift.title,
+            "price": price_value,
+            "url": gift.url,
+            "image_url": gift.image_url,
+            "is_reserved": gift.is_reserved,
+            "collected": total_value,
+            "progress": progress,
+            "reserved_by": reserved_by,
+            "contributors": contributors,
+            "has_contributions": len(contributors) > 0 if not is_owner else (total_value > 0),
+        })
 
     return result
 
 @app.put("/wishlists/{wishlist_id}")
 def update_wishlist(
-    wishlist_id: int, 
+    wishlist_id: int,
     payload: schemas.WishlistCreateWithOwner,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id_required),
 ):
     wishlist = db.query(models.Wishlist).filter(models.Wishlist.id == wishlist_id).first()
     if not wishlist:
         return {"error": "Вишлист не найден"}
+    if wishlist.owner_id != current_user_id:
+        raise HTTPException(status_code=403, detail="Только владелец может редактировать вишлист")
 
     wishlist.title = payload.title
     wishlist.description = payload.description
     wishlist.event_date = payload.event_date
-    wishlist.owner_id = payload.owner_id
 
     db.commit()
     db.refresh(wishlist)
     return wishlist
 
+
 @app.delete("/wishlists/{wishlist_id}")
-def delete_wishlist(wishlist_id: int, db: Session = Depends(get_db)):
+def delete_wishlist(
+    wishlist_id: int,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id_required),
+):
     wishlist = db.query(models.Wishlist).filter(models.Wishlist.id == wishlist_id).first()
     if not wishlist:
         return {"error": "Вишлист не найден"}
+    if wishlist.owner_id != current_user_id:
+        raise HTTPException(status_code=403, detail="Только владелец может удалить вишлист")
 
     db.delete(wishlist)
     db.commit()
@@ -445,17 +539,22 @@ def websocket_test():
     }
 
 @app.get("/users/{user_id}")
-def get_user(user_id: int, db: Session = Depends(get_db)):
+def get_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id_required),
+):
+    if user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="Можно запрашивать только свой профиль")
     try:
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if not user:
             return {"error": "Пользователь не найден"}
-        
         return {
             "id": user.id,
             "email": user.email,
             "name": user.name,
-            "created_at": user.registered_at.isoformat() if user.registered_at else None
+            "created_at": user.registered_at.isoformat() if user.registered_at else None,
         }
     except Exception as e:
         print(f"Error getting user: {e}")
