@@ -5,6 +5,7 @@ import re
 import string
 from datetime import datetime
 import json
+from urllib.parse import urljoin
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
@@ -160,6 +161,7 @@ def parse_url(url: str):
             resp = client.get(u, headers=headers)
             resp.raise_for_status()
             html = resp.text
+            base_url = str(resp.url)
     except httpx.HTTPError as e:
         print(f"parse-url fetch error: {e}")
         return {"title": None, "image": None, "price": None}
@@ -264,14 +266,25 @@ def parse_url(url: str):
         html,
         re.I,
     ):
-        image = meta.group(1).strip()
-        if image and image.startswith(("http://", "https://")):
+        candidate = meta.group(1).strip()
+        if candidate:
+            image = candidate
             break
     if not image:
         for meta in re.finditer(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\']', html, re.I):
-            image = meta.group(1).strip()
-            if image and image.startswith(("http://", "https://")):
+            candidate = meta.group(1).strip()
+            if candidate:
+                image = candidate
                 break
+
+    # Нормализуем URL картинки: протокол-относительные и относительные пути
+    if image:
+        if image.startswith("//"):
+            # //cdn.site.com/img.jpg -> https://cdn.site.com/img.jpg
+            image = "https:" + image
+        elif not image.startswith(("http://", "https://")) and "base_url" in locals():
+            # /img/pic.jpg или img/pic.jpg -> абсолютный URL
+            image = urljoin(base_url, image)
 
     # 4) Попытка достать цену по текстовым паттернам, если не нашли в JSON-LD
     price_match = re.search(r'"price"\s*:\s*["\']?([0-9\s.,]+)["\']?', html)
